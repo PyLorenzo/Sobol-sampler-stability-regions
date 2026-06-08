@@ -314,7 +314,7 @@ $$D_N^* \sim \frac{(\log N)^d}{N}$$
 compared to $D_N^* \sim N^{-1/2}$ for pseudo-random Monte Carlo and
 $D_N^* \sim N^{-1/d}$ for a regular grid. 
 
-
+![Computer](Sobol_uniformity_rate.png)
 
 The practical consequence is that
 the Sobol sequence achieves the same coverage uniformity as a grid but with
