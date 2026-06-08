@@ -142,7 +142,7 @@ pyyaml
 ### EFTCAMB
 
 This pipeline requires the EFTCAMB-patched version of CAMB that includes the
-TPM model (`007p8_TPM.f90`). Point Cobaya to your build via the `path` field
+TPM model, but it can be generalized to any model. Point Cobaya to your build via the `path` field
 in the YAML:
 
 ```yaml
@@ -569,5 +569,5 @@ the master Python process.
 ## Author
 
 Lorenzo Baldazzi  
-PhD student, Università di Bologna  
+PhD student, Università degli Studi di Roma Tor Vergata  
 2026
