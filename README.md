@@ -123,7 +123,7 @@ pip install torch scikit-learn scipy numpy matplotlib pyyaml
 
 ### EFTCAMB
 
-This pipeline requires the EFTCAMB-patched version of CAMB that includes the TPM model (`007p8_TPM.f90`). Point Cobaya to your build via the `path` field in the YAML:
+This pipeline requires the EFTCAMB-patched version of CAMB that includes the TPM model, but it can be generalized to any model. Point Cobaya to your build via the `path` field in the YAML:
 
 ```yaml
 theory:
