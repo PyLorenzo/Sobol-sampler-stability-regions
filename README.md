@@ -495,7 +495,7 @@ $$\Delta w = -\alpha \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \varepsilon}$$
 This adapts the effective step size for each weight independently, making it
 robust to the different curvatures of the loss along different parameter
 directions — particularly useful when the stability boundary has very different
-sharpness in the $\Omega_0$/$c_0$ plane compared to the $\log_{10}a_T$/$\sigma$
+sharpness in the $\Omega_0$ - $c_0$ plane compared to the $\log_{10}a_T$ - $\sigma$
 plane.
 
 **Model selection.** The training set uses 80% of the labelled data, with the
