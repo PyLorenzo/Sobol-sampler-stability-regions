@@ -505,10 +505,7 @@ overfitting.
 `NNFastPrior` is registered with Cobaya as a `Likelihood`, making it part of
 the posterior:
 
-$$\log\mathcal{P}(\theta \mid d) = \log\mathcal{L}_\text{Planck}(\theta)
-  + \log\mathcal{L}_\text{BAO}(\theta) + \ldots
-  + \underbrace{\log p_\text{NN}(\theta)}_{\in \{0,\,-\infty\}}
-  + \log\pi(\theta)$$
+$$\log\mathcal{P}(\theta \mid d) = \log\mathcal{L}_\text{Planck}(\theta)+ \log\mathcal{L}_\text{BAO}(\theta) + \ldots+ \underbrace{\log p_\text{NN}(\theta)}_{\in \{0,\,-\infty\}}+ \log\pi(\theta)$$
 
 The fast prior contributes $0$ if the network predicts stability and $-\infty$
 otherwise. Crucially, within the stable region it leaves the posterior
