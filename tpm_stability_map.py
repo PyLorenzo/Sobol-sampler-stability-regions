@@ -3,34 +3,38 @@ Author: Lorenzo Baldazzi
 Affiliation: University of Rome Tor Vergata
 Date: 2026-05-18
 
-TPM stability-region mapper.
+Stability-region mapper using Sobol quasi-Monte Carlo sampling.
 
 Goal
 ----
-For the TPM modified gravity model implemented in EFTCAMB, identify the subset of
-the 4-D parameter space
+For a modified gravity model implemented in EFTCAMB, identify the subset of
+the parameter space for which EFTCAMB declares the model "stable" under chosen
+stability flags. Fixed parameters are pinned at reference values from the
+user's Cobaya YAML.
 
-        theta = (Log_aT, sig, M, c)            (xT, sigma, Omega_0, c_0)
-
-for which EFTCAMB declares the model "stable" under the chosen ghost / gradient
-flags. The 6 LCDM parameters are pinned at the centers of their `ref`
-distributions in the user's Cobaya YAML.
-
---------------------------------------------
-1. Base Sobol QMC sample of N0 points in the 4-D box defined by the priors.
+Algorithm
+---------
+1. Base Sobol QMC sample of N0 points in the parameter space (defined by priors).
 2. Parallel stability evaluation via Cobaya: model.loglike(theta) is finite
-   if EFTCAMB initialises successfully (= stable for the chosen flags).
+   if EFTCAMB initialises successfully (= stable for chosen flags).
 3. K-NN based boundary-uncertainty score; new Sobol points drawn inside the
    bounding box of the top decile of uncertain points. Repeat K times.
 4. Pickle the labelled point cloud for downstream visualisation.
 
 Usage
 -----
-    # quick smoke test (~ 1 minute on 4 cores)
-    python tpm_stability_map.py --base 64 --refine-iters 0
+    # Create a configuration file from the template
+    cp config_template.yaml my_config.yaml
+    # Edit my_config.yaml with your paths and parameter ranges
 
-    # full run (tens of minutes to hours depending on cores)
-    python tpm_stability_map.py --base 4096 --refine-iters 3 --refine-batch 1024
+    # Quick smoke test (~ 1 minute on 4 cores)
+    python tpm_stability_map.py --config my_config.yaml --base 64 --refine-iters 0
+
+    # Full run (tens of minutes to hours depending on cores and parameters)
+    python tpm_stability_map.py --config my_config.yaml --base 4096 --refine-iters 3 --refine-batch 1024
+
+    # Using a custom output directory
+    python tpm_stability_map.py --config my_config.yaml --outdir ./results
 
 The script writes a pickle file containing the labelled samples; pass that to
 `tpm_stability_viz.py` to plot the maps.
@@ -53,40 +57,57 @@ from scipy.stats import qmc
 
 
 # ----------------------------------------------------------------------
-# 1. CONFIGURATION
+# 1. CONFIGURATION HELPERS
 # ----------------------------------------------------------------------
 
-# Path to the user's Cobaya YAML, used as the source of truth for the theory block
+def load_config(yaml_path: str) -> dict:
+    """Load configuration from YAML file."""
+    if not os.path.exists(yaml_path):
+        raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
+    
+    with open(yaml_path) as f:
+        config = yaml.safe_load(f)
+    
+    return config
 
 
-DEFAULT_YAML = "your_yaml.yaml"
+def validate_config(config: dict) -> None:
+    """Validate that required keys exist in the configuration."""
+    required_keys = ["cobaya_yaml", "tpm_ranges", "tpm_fixed"]
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required configuration key: {key}")
 
-# TPM parameter ranges, taken from the YAML prior blocks 
 
-TPM_RANGES: Dict[str, Tuple[float, float]] = {
-    "Log_aT": (-7.5,  -3.5),   # log10(a_T)
-    "sig":    ( 0.4,   3.0),   # sigma (Gaussian width)
-    "M":      (-0.15,  0.015), # Omega_0
-    "c":      (-0.1,   0.01),  # c_0
-}
+def get_tpm_ranges_and_fixed(config: dict) -> Tuple[Dict, Dict]:
+    """Extract parameter ranges and fixed parameters from config."""
+    tpm_ranges = config.get("tpm_ranges", {})
+    tpm_fixed = config.get("tpm_fixed", {})
+    
+    if not tpm_ranges:
+        raise ValueError("tpm_ranges cannot be empty in configuration")
+    if not tpm_fixed:
+        raise ValueError("tpm_fixed cannot be empty in configuration")
+    
+    # Convert lists to tuples if needed
+    tpm_ranges = {k: tuple(v) if isinstance(v, list) else v 
+                  for k, v in tpm_ranges.items()}
+    
+    return tpm_ranges, tpm_fixed
 
-# TPM parameter values pinned at the centers of the 'ref' distributions.
 
-TPM_FIXED: Dict[str, float] = {
-    "ombh2": 0.0224,
-    "omch2": 0.118,
-    "tau":   0.055,
-    "logA":  3.05,
-    "ns":    0.965,
-    "H0":    72.0,
-}
+# Store TPM parameters globally for worker processes
+_TPM_RANGES = None
+_TPM_FIXED = None
+_MODEL = None
+_YAML_PATH = None
 
 
 # ----------------------------------------------------------------------
 # 2. BUILD A MINIMAL COBAYA MODEL
 # ----------------------------------------------------------------------
 
-def build_cobaya_info(yaml_path: str) -> dict:
+def build_cobaya_info(yaml_path: str, tpm_ranges: Dict, tpm_fixed: Dict) -> dict:
     """
     Construct a Cobaya `info` dict whose loglike only fires the EFTCAMB
     stability check.
@@ -97,10 +118,9 @@ def build_cobaya_info(yaml_path: str) -> dict:
     - Silence EFTCAMB feedback if you want to (avoid console spam in parallel).
     - Drop the user's likelihoods / sampler / output; install the no-op `one`
       likelihood instead -- loglike == 0 if all theories succeed, -inf else.
-    - Declare every TPM control parameter as `sampled` with a uniform
-      prior covering its range (priors are not consulted by loglike).
-    - Preserve the YAML's derived-parameter definitions (e.g. the As <- logA
-      lambda) so that Cobaya can still satisfy CAMB's input requirements.
+    - Declare every parameter as `sampled` with uniform priors covering their ranges.
+    - Preserve the YAML's derived-parameter definitions (e.g. As <- logA)
+      so that Cobaya can still satisfy CAMB's input requirements.
     """
     with open(yaml_path) as f:
         base = yaml.safe_load(f)
@@ -113,20 +133,21 @@ def build_cobaya_info(yaml_path: str) -> dict:
     }
 
     # Silence CAMB / EFTCAMB feedback inside the workers.
-    info["theory"]["camb"].setdefault("extra_args", {})["feedback_level"] = 3
+    if "camb" in info["theory"]:
+        info["theory"]["camb"].setdefault("extra_args", {})["feedback_level"] = 3
 
-    # ---- TPM control parameters (sampled with uniform priors).
+    # ---- Fixed parameters (sampled with uniform priors).
     # A uniform prior over [v-eps, v+eps] is enough because loglike never
     # consults the prior; we just need Cobaya to accept these names as inputs.
-    for name, val in TPM_FIXED.items():
+    for name, val in tpm_fixed.items():
         eps = max(abs(val), 1.0)
         info["params"][name] = {
             "prior": {"min": val - eps, "max": val + eps},
             "latex": name,
         }
 
-    # ---- TPM control parameters (sampled over their physical ranges).
-    for name, (lo, hi) in TPM_RANGES.items():
+    # ---- Variable parameters (sampled over their physical ranges).
+    for name, (lo, hi) in tpm_ranges.items():
         info["params"][name] = {
             "prior": {"min": lo, "max": hi},
             "latex": name,
@@ -144,10 +165,10 @@ def build_cobaya_info(yaml_path: str) -> dict:
     return info
 
 
-def make_model(yaml_path: str):
+def make_model(yaml_path: str, tpm_ranges: Dict, tpm_fixed: Dict):
     """Lazy import of Cobaya so workers can pickle this module."""
     from cobaya.model import get_model
-    return get_model(build_cobaya_info(yaml_path))
+    return get_model(build_cobaya_info(yaml_path, tpm_ranges, tpm_fixed))
 
 
 # ----------------------------------------------------------------------
@@ -156,9 +177,9 @@ def make_model(yaml_path: str):
 
 def is_stable(model, theta: Dict[str, float]) -> bool:
     """
-    Return True iff EFTCAMB declares the parameter point stable.
+    Return True iff the theory declares the parameter point stable.
 
-    `theta` must contain values for every control parameter (LCDM + TPM).
+    `theta` must contain values for every control parameter.
     """
     try:
         ll = model.loglike(theta,
@@ -206,42 +227,43 @@ def sobol_points(n: int,
 # Each worker process keeps its own Cobaya model alive (heavy to build).
 # We use globals because mp.Pool initialisers can't return values.
 
-_MODEL = None
-_YAML_PATH = None
-
-def _worker_init(yaml_path: str):
+def _worker_init(yaml_path: str, tpm_ranges: Dict, tpm_fixed: Dict):
     """Build one Cobaya model per worker, once."""
-    global _MODEL, _YAML_PATH
+    global _MODEL, _YAML_PATH, _TPM_RANGES, _TPM_FIXED
     _YAML_PATH = yaml_path
-    _MODEL = make_model(yaml_path)
+    _TPM_RANGES = tpm_ranges
+    _TPM_FIXED = tpm_fixed
+    _MODEL = make_model(yaml_path, tpm_ranges, tpm_fixed)
 
 
 def _worker_eval(theta_row_with_names) -> bool:
     """Evaluate stability for a single point."""
     names, row = theta_row_with_names
     theta = dict(zip(names, row))
-    # Add TPM fixed values (constant for all calls)
-    theta.update(TPM_FIXED)
+    # Add fixed parameters (constant for all calls)
+    theta.update(_TPM_FIXED)
     return is_stable(_MODEL, theta)
 
 
 def evaluate_points(points: np.ndarray,
                     yaml_path: str,
+                    tpm_ranges: Dict,
+                    tpm_fixed: Dict,
                     n_workers: int,
                     chunksize: int = 4) -> np.ndarray:
     """
-    Evaluate stability on every row of `points` (each row = TPM theta only).
+    Evaluate stability on every row of `points`.
 
     Returns
     -------
     labels: ndarray of bool, shape (n,)
     """
-    names = tuple(TPM_RANGES.keys())
+    names = tuple(tpm_ranges.keys())
     payload = [(names, row) for row in points]
 
     if n_workers <= 1:
         # Serial fallback (also useful for debugging tracebacks).
-        _worker_init(yaml_path)
+        _worker_init(yaml_path, tpm_ranges, tpm_fixed)
         labels = [bool(_worker_eval(p)) for p in payload]
         return np.array(labels, dtype=bool)
 
@@ -249,7 +271,7 @@ def evaluate_points(points: np.ndarray,
     # creep from CAMB's Fortran heap.
     with mp.Pool(processes=n_workers,
                  initializer=_worker_init,
-                 initargs=(yaml_path,),
+                 initargs=(yaml_path, tpm_ranges, tpm_fixed),
                  maxtasksperchild=200) as pool:
         labels = pool.map(_worker_eval, payload, chunksize=chunksize)
 
@@ -342,8 +364,10 @@ def refine_box(points: np.ndarray,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--yaml", default=DEFAULT_YAML,
-                    help="Path to the Cobaya YAML (default: %(default)s)")
+    ap.add_argument("--config", required=True,
+                    help="Path to configuration YAML file with parameter ranges and paths")
+    ap.add_argument("--yaml", default=None,
+                    help="Override Cobaya YAML path from config (optional)")
     ap.add_argument("--base", type=int, default=4096,
                     help="Base Sobol sample size (default: %(default)s)")
     ap.add_argument("--refine-iters", type=int, default=3,
@@ -357,40 +381,63 @@ def main():
                     help="Number of parallel workers (default: ncpu-1)")
     ap.add_argument("--seed", type=int, default=42,
                     help="Sobol seed (default: %(default)s)")
-    ap.add_argument("--output", default="./tpm_stability_map.pkl",
-                    help="Output pickle file (default: %(default)s)")
+    ap.add_argument("--outdir", default=".",
+                    help="Output directory for results (default: %(default)s)")
     ap.add_argument("--serial", action="store_true",
                     help="Run serially (useful for debugging)")
     args = ap.parse_args()
 
+    # Load and validate configuration
+    try:
+        config = load_config(args.config)
+        validate_config(config)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Get parameter ranges and fixed values from config
+    tpm_ranges, tpm_fixed = get_tpm_ranges_and_fixed(config)
+    
+    # Get Cobaya YAML path (can be overridden by command line)
+    cobaya_yaml = args.yaml if args.yaml else config["cobaya_yaml"]
+    
+    if not os.path.exists(cobaya_yaml):
+        print(f"ERROR: Cobaya YAML not found: {cobaya_yaml}", file=sys.stderr)
+        sys.exit(1)
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.outdir, exist_ok=True)
+
     n_workers = 1 if args.serial else args.workers
+    output_file = os.path.join(args.outdir, "stability_map.pkl")
 
     print("=" * 64)
-    print(" TPM stability mapping")
+    print(" Stability Region Mapper")
     print("=" * 64)
-    print(f"   YAML            : {args.yaml}")
+    print(f"   Config file     : {args.config}")
+    print(f"   Cobaya YAML     : {cobaya_yaml}")
     print(f"   Workers         : {n_workers}")
     print(f"   Base Sobol      : {args.base}")
     print(f"   Refine passes   : {args.refine_iters} x {args.refine_batch}")
-    print(f"   Output          : {args.output}")
+    print(f"   Output dir      : {args.outdir}")
     print()
-    print("   TPM ranges:")
-    for k, (lo, hi) in TPM_RANGES.items():
-        print(f"      {k:8s} in [{lo:+.4f}, {hi:+.4f}]")
-    print("   TPM fixed:")
-    for k, v in TPM_FIXED.items():
-        print(f"      {k:8s} = {v}")
+    print("   Variable parameter ranges:")
+    for k, (lo, hi) in tpm_ranges.items():
+        print(f"      {k:16s} in [{lo:+.6f}, {hi:+.6f}]")
+    print("   Fixed parameters:")
+    for k, v in tpm_fixed.items():
+        print(f"      {k:16s} = {v}")
     print()
 
     # ---- (1) Base global sample ----
     print("[1/3] Generating base Sobol sample ...")
     t0 = time.time()
-    pts = sobol_points(args.base, TPM_RANGES, seed=args.seed)
+    pts = sobol_points(args.base, tpm_ranges, seed=args.seed)
     print(f"      {pts.shape[0]} points; "
           f"Sobol size rounded to 2**{int(np.ceil(np.log2(max(args.base,2))))}.")
 
     print("[2/3] Evaluating base sample (parallel) ...")
-    labels = evaluate_points(pts, args.yaml, n_workers)
+    labels = evaluate_points(pts, cobaya_yaml, tpm_ranges, tpm_fixed, n_workers)
     dt = time.time() - t0
     print(f"      done in {dt:.1f} s "
           f"({dt / len(pts) * 1e3:.1f} ms/pt amortised, "
@@ -408,10 +455,10 @@ def main():
             np.vstack(all_pts),
             np.concatenate(all_lab),
             args.refine_batch,
-            TPM_RANGES,
+            tpm_ranges,
             seed=args.seed + 100 + it,
         )
-        new_lab = evaluate_points(new, args.yaml, n_workers)
+        new_lab = evaluate_points(new, cobaya_yaml, tpm_ranges, tpm_fixed, n_workers)
         dt = time.time() - t0
         all_pts.append(new)
         all_lab.append(new_lab)
@@ -425,23 +472,23 @@ def main():
     all_lab_arr = np.concatenate(all_lab)
 
     # ---- (3) Save ----
-    print(f"[done] Saving {len(all_pts_arr)} labelled points to {args.output}")
-    with open(args.output, "wb") as f:
+    print(f"[done] Saving {len(all_pts_arr)} labelled points to {output_file}")
+    with open(output_file, "wb") as f:
         pickle.dump({
-            "param_names":   list(TPM_RANGES.keys()),
-            "param_ranges":  TPM_RANGES,
-            "tpm_fixed":     TPM_FIXED,
-            "points":        all_pts_arr,        # shape (N, 4)
+            "param_names":   list(tpm_ranges.keys()),
+            "param_ranges":  tpm_ranges,
+            "fixed_params":  tpm_fixed,
+            "points":        all_pts_arr,        # shape (N, d)
             "stable":        all_lab_arr,        # shape (N,)
             "iter_info":     iter_info,
-            "yaml":          os.path.abspath(args.yaml),
+            "cobaya_yaml":   os.path.abspath(cobaya_yaml),
         }, f)
 
     print()
     print(f"   Total evaluations : {len(all_pts_arr)}")
     print(f"   Global stable frac: {all_lab_arr.mean():.4f}")
     print()
-    print("Next step:  python tpm_stability_viz.py", args.output)
+    print(f"Next step:  python tpm_stability_viz.py {output_file}")
 
 
 if __name__ == "__main__":
